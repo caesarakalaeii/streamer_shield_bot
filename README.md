@@ -12,6 +12,26 @@ StreamerShield is an AI-powered ChatBot designed to protect Twitch streamers fro
 - **Automated Banning**: Can automatically ban users based on AI predictions
 - **Data Collection**: Optional data collection for improving the AI model
 
+## Docker Image
+
+A Docker image is available for this project. See the `build_and_push.yml` workflow for details on how the image is built and published.  
+The Docker image is available at [ghcr.io/caesarakalaeii/streamer-shield](https://ghcr.io/caesarakalaeii/streamer-shield).
+
+## Environment Variables
+
+The following environment variables are required for proper operation:
+
+- `TWITCH_CLIENT_ID`: Twitch Developer Application Client ID
+- `TWITCH_CLIENT_SECRET`: Twitch Developer Application Client Secret
+- `TWITCH_BOT_TOKEN`: OAuth token for the bot
+- `TWITCH_CHANNEL`: Twitch channel to monitor
+- `DATABASE_URL`: PostgreSQL connection string
+- `AI_PREDICTION_ENDPOINT`: URL for the AI prediction service
+- `DATA_COLLECTION_ENABLED`: Set to `true` to enable data collection (optional)
+- `USER_AGE_THRESHOLD`: Minimum account age for users (optional)
+- `MESSAGE_LENGTH_THRESHOLD`: Minimum message length for filtering (optional)
+
+
 ## Project Structure
 
 ```
@@ -180,3 +200,4 @@ For more details about StreamerShield, visit: https://caes.ar
 ## License
 
 [Add your license information here]
+

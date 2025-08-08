@@ -613,6 +613,9 @@ app.secret_key = 'your_secret_key'
 def login():
     return redirect(auth.return_auth_url())
 
+@app.route('/health')
+def login():
+    return 'I\'m Healthy',200
 
 
 @app.route('/login/confirm')
