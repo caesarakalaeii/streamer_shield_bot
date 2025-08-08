@@ -614,7 +614,7 @@ def login():
     return redirect(auth.return_auth_url())
 
 @app.route('/health')
-def login():
+def health():
     return 'I\'m Healthy',200
 
 
