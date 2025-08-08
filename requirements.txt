@@ -1,0 +1,8 @@
+quart
+requests
+discord
+ipaddress
+twitchAPI
+tensorflow
+numpy
+asyncpg
