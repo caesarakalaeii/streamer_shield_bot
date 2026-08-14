@@ -1,3 +1,12 @@
 .idea
 __pycache__
 .venv
+
+# nix dev environment (flake.nix)
+.direnv/
+result
+result-*
+
+# tool caches
+.ruff_cache/
+*.pyc
