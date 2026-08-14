@@ -13,9 +13,12 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
+    # `self` is load-bearing, not decoration: rootPreamble bakes ${self} in as
+    # the fallback $REPO_ROOT, which is what stops a verb invoked as
+    # `nix run /path/to/repo#fmt` from acting on the caller's directory.
     # `...` rather than a closed { self, nixpkgs }: adding a second input later
-    # would otherwise fail with "called with unexpected argument 'self'".
-    { nixpkgs, ... }:
+    # would otherwise fail with "called with unexpected argument 'flake-utils'".
+    { self, nixpkgs, ... }:
     let
       lib = nixpkgs.lib;
 
@@ -121,6 +124,11 @@
       # .github/workflows/build_and_push.yml. A stub that echoed "not
       # applicable" would turn `nix flake show` into a liar. Add `test` here in
       # the same breath as the first real test.
+      #
+      # EVERY text below is anchored to $REPO_ROOT and none of them touch a
+      # relative path -- see rootPreamble. A new verb that ends in a bare "$@"
+      # is a bug, not a style choice: it makes `nix run /path/to/repo#<verb>`
+      # act on whatever directory the caller happened to be standing in.
       commands = pkgs: {
         setup = {
           # requirements.txt is unpinned and pulls tensorflow (~600 MB wheel),
@@ -128,9 +136,17 @@
           # discord and ipaddress are listed but imported by nothing in this
           # repo; they are installed anyway rather than second-guessing the
           # manifest in a flake.
-          description = "(network) create .venv from requirements.txt (large: pulls tensorflow)";
-          text = ''
-            uv venv "$REPO_ROOT/.venv"
+          #
+          # --allow-existing is what makes this verb re-runnable, and it is not
+          # optional: without it uv exits 2 with "A virtual environment already
+          # exists at: .venv" and `uv pip install` never runs, so the bootstrap
+          # verb fails on every tree that has already been bootstrapped once --
+          # i.e. after a requirements.txt change, or on any agent's second
+          # attempt. Not --clear: that deletes the venv and re-downloads
+          # tensorflow to reach a state we could have updated in place.
+          description = "(network) create/update .venv from requirements.txt (large: pulls tensorflow)";
+          text = requireCheckout + ''
+            uv venv --allow-existing "$REPO_ROOT/.venv"
             uv pip install --python "$REPO_ROOT/.venv/bin/python" -r "$REPO_ROOT/requirements.txt"
           '';
         };
@@ -143,12 +159,34 @@
           # rules in this file. If the repo wants a narrower set, that decision
           # belongs in a committed ruff config, where the editor and CI can see
           # it too.
+          #
+          # "''${@:-$REPO_ROOT}" -- an explicit path still wins, so `dev-lint
+          # logger.py` works and resolves against the caller's cwd, but with no
+          # arguments this checks the repo and nothing else. A bare "$@" here
+          # made `nix run /path/to/repo#lint` (the flake-URL form CI and a cold
+          # agent use) lint the CALLER's directory instead: three findings in a
+          # scratch dir, or "All checks passed!" in an empty one, while the repo
+          # itself has 65. A gate that reports green by inspecting zero files is
+          # worse than no gate.
+          #
+          # --no-cache because ruff's cache lands in .ruff_cache in its CWD,
+          # i.e. outside the repo under the flake-URL form; and because ruff
+          # treats a cache directory it cannot create as a hard error -- exit 2
+          # with zero findings, which is the same false signal wearing a
+          # different hat, and $REPO_ROOT is not writable when it resolves to
+          # the store snapshot. Four Python files here, so the cache buys
+          # nothing measurable in exchange.
           description = "ruff check (default rules; the repo has pre-existing findings)";
-          text = ''ruff check "$@"'';
+          text = ''ruff check --no-cache "''${@:-$REPO_ROOT}"'';
         };
         fmt = {
-          description = "ruff format (rewrites files)";
-          text = ''ruff format "$@"'';
+          # Same anchoring as lint, and it matters more here: `ruff format` is
+          # MUTATING, so the old bare "$@" turned `nix run /path/to/repo#fmt`
+          # into "silently rewrite every Python file under the caller's cwd".
+          # requireCheckout on top, because with no writable checkout in sight
+          # the only correct behaviour is to refuse.
+          description = "ruff format (rewrites files in this repo)";
+          text = requireCheckout + ''ruff format --no-cache "''${@:-$REPO_ROOT}"'';
         };
         run = {
           # The venv interpreter and the script both by absolute path, not a
@@ -160,8 +198,18 @@
           # twitch_config.py raises immediately, plus a reachable Postgres
           # (DB_HOST/DB_PORT/...). It binds 0.0.0.0:38080 for the Quart auth and
           # EventSub endpoints.
+          #
+          # `cd "$REPO_ROOT"` because the two absolute paths anchor what gets
+          # executed but not where it writes: the bot's own write_list() opens
+          # its argument relative to the CWD, and twitchAPI stores refresh
+          # tokens the same way. Started via `nix run /path/to/repo#run` those
+          # land in the caller's directory. This also matches the Dockerfile,
+          # which runs the same script under WORKDIR /app.
           description = "start the bot (needs `setup`, TWITCH_APP_ID/SECRET and a Postgres)";
-          text = ''"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/streamer_shield_chatbot.py" "$@"'';
+          text = requireCheckout + ''
+            cd "$REPO_ROOT"
+            "$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/streamer_shield_chatbot.py" "$@"
+          '';
         };
       };
 
@@ -179,13 +227,67 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # Every command gets $REPO_ROOT. `nix run` and `nix develop` both start in
-      # whatever directory they were invoked from, so a bare `.venv` silently
-      # forks a second environment as soon as an agent works from a subdirectory.
-      # Note we do NOT cd there: commands act on the caller's cwd on purpose.
+      # Every command gets $REPO_ROOT, and every command above is anchored to
+      # it. `nix run` and `nix develop` both start in whatever directory they
+      # were invoked from, so an unanchored verb reads -- or, for fmt, REWRITES
+      # -- files that have nothing to do with this repo.
+      #
+      # Resolution is git-first on purpose: inside a checkout the verbs must act
+      # on the live working tree, uncommitted edits included, or `dev-fmt` is
+      # pointless. But `git rev-parse` answers with whatever repo the CALLER is
+      # standing in, and the old `|| pwd` fallback answered with the caller's
+      # cwd, so neither can be trusted on its own. The answer is accepted only
+      # when that tree's flake.nix is byte-identical to the one this wrapper was
+      # built from -- i.e. it really is a checkout of THIS flake, not a sibling
+      # repo with a flake of its own. Nix copies modified tracked files into the
+      # source snapshot (that is what the "Git tree is dirty" warning means), so
+      # an uncommitted flake.nix edit still compares equal.
+      #
+      # Everything else falls back to ${self}: this flake's own source, baked in
+      # at eval time. That is precisely the tree a `nix run /path/to/repo#lint`
+      # names, so a read-only verb reports the same findings from any cwd on
+      # earth. It is also read-only, being in /nix/store, which is why the
+      # writing verbs pair this with requireCheckout below rather than relying
+      # on file permissions to stop them.
+      #
+      # $(<file) rather than cmp/diff: those live in diffutils, which is not in
+      # this repo's toolchain, so they would resolve out of the caller's ambient
+      # PATH or not at all. The read is a bash builtin.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+        REPO_ROOT="${self}"
+        if gitRoot="$(git rev-parse --show-toplevel 2>/dev/null)" &&
+          [ -f "$gitRoot/flake.nix" ] &&
+          [ "$(<"$gitRoot/flake.nix")" = "$(<"${self}/flake.nix")" ]; then
+          REPO_ROOT="$gitRoot"
+        fi
         export REPO_ROOT
+      '';
+
+      # Prepended to every verb that WRITES (setup, fmt, run). $REPO_ROOT is
+      # writable exactly when it is a real checkout; the /nix/store fallback is
+      # not, and refusing is the only correct answer there -- the alternative is
+      # a mutating verb hunting for somewhere else to put its output, which is
+      # the bug this whole block exists to kill. Refusing up front rather than
+      # letting the tool trip over the read-only store: both do fail there, but
+      # they fail as "Failed to write /nix/store/...: Read-only file system (os
+      # error 30)", which says nothing about which directory you should have been
+      # standing in. This also stops the guarantee from resting on store
+      # permissions, which are not this flake's to promise.
+      #
+      # Kept out of rootPreamble and pasted into the three verbs instead:
+      # rootPreamble is also run by the dev shell's shellHook, where a guard
+      # would fire on `nix develop` from an unrelated directory and a helper
+      # function would leak into the user's interactive session. This way `lint`,
+      # which is read-only and legitimately works from the snapshot, carries no
+      # dead code.
+      #
+      # ''${0##*/} is the wrapper's own name (dev-fmt), without needing basename.
+      requireCheckout = ''
+        if [ ! -w "$REPO_ROOT" ]; then
+          echo "''${0##*/}: \$REPO_ROOT is $REPO_ROOT, which is not a writable checkout." >&2
+          echo "''${0##*/}: this verb writes files -- run it from inside a clone of this repo." >&2
+          exit 1
+        fi
       '';
 
       # One derivation per command, reused by both `apps` and the dev shell, so
@@ -307,6 +409,57 @@
                   exit 1
                 }
               done
+              touch "$out"
+            '';
+
+        # The regression test for the defect this file used to have: every verb
+        # ended in a bare "$@", so `nix run /path/to/repo#fmt` from an unrelated
+        # directory rewrote the CALLER's Python files and `#lint` graded them
+        # instead of ours. A build sandbox is an honest stand-in for "an
+        # unrelated directory" -- writable, not a git repo, and not this repo --
+        # which is what makes this cheap enough to gate on. Revert the anchoring
+        # in `commands` and this check goes red; it cannot pass vacuously.
+        anchoring =
+          pkgs.runCommand "anchoring-check"
+            {
+              nativeBuildInputs = lib.attrValues (wrappers pkgs);
+            }
+            ''
+              mkdir decoy
+              cd decoy
+              printf 'import os,sys\nx=1\n' > decoy.py
+              cp decoy.py untouched.py
+
+              # dev-fmt mutates. From outside a checkout there is nothing it may
+              # legitimately write, so it has to refuse. Both halves matter: a
+              # non-zero exit alone would still permit a partial rewrite, and an
+              # untouched decoy alone would be satisfied by a silent no-op.
+              if dev-fmt > fmt.log 2>&1; then
+                echo "dev-fmt exited 0 outside a checkout; it must refuse" >&2
+                exit 1
+              fi
+              diff decoy.py untouched.py || {
+                echo "dev-fmt rewrote a file outside the repo" >&2
+                exit 1
+              }
+
+              # dev-lint is read-only, so unlike fmt it must still WORK from
+              # here, and report this repo. Comparing the no-argument run
+              # against an explicit ${self} pins exactly that, and stays valid
+              # if someone fixes the repo's 65 pre-existing findings -- an
+              # assertion on the exit code would rot the day the code got clean.
+              # `|| true` because ruff exits 1 while those findings stand.
+              dev-lint > implicit.log 2>&1 || true
+              dev-lint "${self}" > explicit.log 2>&1 || true
+              diff implicit.log explicit.log || {
+                echo "dev-lint with no arguments did not inspect the repo" >&2
+                exit 1
+              }
+              if grep -q decoy.py implicit.log; then
+                echo "dev-lint inspected the caller's files" >&2
+                exit 1
+              fi
+
               touch "$out"
             '';
       });
